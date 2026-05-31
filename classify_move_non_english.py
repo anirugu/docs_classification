@@ -158,7 +158,7 @@ SUPPORTED_EXTENSIONS = (
     | DOC_EXTENSIONS
 )
 DEFAULT_PDF_PAGES = 15
-DEFAULT_WORKERS = max(1, min(8, os.cpu_count() or 1))
+DEFAULT_WORKERS = max(1, os.cpu_count() or 1)
 CACHE_VERSION = 2
 
 
@@ -276,7 +276,8 @@ def read_epub(path):
             names = archive.namelist()
             for name in names:
                 if name.lower().endswith(".opf"):
-                    data = archive.read(name)[:200000].decode("utf-8", "ignore")
+                    with archive.open(name) as f:
+                        data = f.read(200000).decode("utf-8", "ignore")
                     match = re.search(
                         r"<dc:language[^>]*>(.*?)</dc:language>",
                         data,
@@ -292,7 +293,8 @@ def read_epub(path):
 
             for name in names:
                 if name.lower().endswith((".xhtml", ".html", ".htm")):
-                    text_parts.append(archive.read(name)[:120000].decode("utf-8", "ignore"))
+                    with archive.open(name) as f:
+                        text_parts.append(f.read(120000).decode("utf-8", "ignore"))
                     if sum(len(part) for part in text_parts) > 200000:
                         break
     except Exception:
@@ -352,7 +354,8 @@ def read_zip_xml(path):
             names = set(archive.namelist())
             for name in candidates:
                 if name in names:
-                    text_parts.append(archive.read(name)[:700000].decode("utf-8", "ignore"))
+                    with archive.open(name) as f:
+                        text_parts.append(f.read(700000).decode("utf-8", "ignore"))
     except Exception:
         pass
 
@@ -574,7 +577,23 @@ def classify(path, pdf_pages=DEFAULT_PDF_PAGES, skip_pdf_text=False):
     elif extension in DOC_EXTENSIONS:
         metadata_language, text = read_doc(path)
     else:
-        return "Unknown", 0, "unsupported"
+        # Unknown / missing extension — attempt a plain-text read as a last resort,
+        # but ONLY if the file header actually looks like human-readable text.
+        # fix_file_extension() already renamed well-known binary formats (PDF, DOC,
+        # DJVU, MOBI, ZIP-based, FB2), so anything still here with no extension is
+        # either plain text (e-mail, log, CSV, raw HTML, etc.) or an unrecognised
+        # binary blob.  We gate on _is_plain_text() to avoid running the language
+        # classifier on random binary garbage.
+        try:
+            with path.open("rb") as _f:
+                _header = _f.read(512)
+        except Exception:
+            return "Unknown", 0, "unsupported"
+        if not _is_plain_text(_header):
+            return "Unknown", 0, "unsupported"
+        metadata_language, text = read_text_file(path)
+        if not text:
+            return "Unknown", 0, "unsupported"
 
     language = normalize_metadata_language(metadata_language)
     if language:
@@ -611,6 +630,24 @@ def unique_destination(destination_directory, file_name):
         index += 1
 
 
+def _is_plain_text(data: bytes, sample: int = 512) -> bool:
+    """Return True when *data* looks like plain (human-readable) text.
+
+    Strategy: take up to *sample* bytes, strip obvious Unicode BOM, then check
+    that the vast majority of bytes are printable ASCII or common UTF-8
+    continuations (0x80-0xBF) rather than raw binary values.
+    """
+    chunk = data[:sample]
+    if not chunk:
+        return False
+    # Count bytes that are NOT plausibly text
+    non_text = sum(
+        1 for b in chunk
+        if b < 0x09 or (0x0E <= b <= 0x1F and b != 0x1B)
+    )
+    return non_text / len(chunk) < 0.05
+
+
 def fix_file_extension(path):
     """
     Reads file magic bytes to detect the true format. If the file is missing an extension
@@ -636,8 +673,39 @@ def fix_file_extension(path):
             detected_ext = ".docx"
         elif b"mimetypeapplication/vnd.oasis.opendocument.text" in header:
             detected_ext = ".odt"
+        else:
+            # Peek inside the ZIP to classify it more precisely.
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    names = [e.filename.lower() for e in zf.infolist() if not e.is_dir()]
+                if names:
+                    IMAGE_EXTS = {".gif", ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+                    HTML_EXTS  = {".html", ".htm", ".xhtml"}
+                    has_images = any(Path(n).suffix in IMAGE_EXTS for n in names)
+                    has_html   = any(Path(n).suffix in HTML_EXTS  for n in names)
+                    has_text   = any(Path(n).suffix in {".txt", ".xml", ".opf"} for n in names)
+                    all_images = all(Path(n).suffix in IMAGE_EXTS for n in names)
+
+                    if has_html or has_text:
+                        # HTML/text content inside ZIP — treat as ZIP-HTML for text reading
+                        detected_ext = ".htm"
+                    elif all_images or (has_images and not has_html and not has_text):
+                        # Image-only archive (comic book, scanned pages, etc.)
+                        detected_ext = ".cbz"
+            except Exception:
+                pass
     elif b"<FictionBook" in header:
         detected_ext = ".fb2"
+    # DJVU: starts with AT&TFORM or FORM...DJVU
+    elif header[:4] in (b"AT&T", b"FORM") and b"DJVU" in header[:16]:
+        detected_ext = ".djvu"
+    # MOBI/AZW: PalmDOC header has "BOOKMOBI" at offset 60
+    elif len(header) >= 68 and header[60:68] == b"BOOKMOBI":
+        detected_ext = ".mobi"
+    # NOTE: plain-text files are intentionally NOT renamed here.
+    # We never give an extensionless file a .txt extension because we can't
+    # know the true format (could be .eml, .mbox, .csv, .log, etc.).
+    # The classify() fallback path handles plain-text reading without renaming.
 
     if detected_ext and path.suffix.lower() != detected_ext:
         # Use stem if we want to replace the wrong extension, or just append it if missing
@@ -913,7 +981,6 @@ def main():
         print("Dry run only; no files moved.")
     else:
         print(f"Destination: {destination}")
-
 
 if __name__ == "__main__":
     main()
