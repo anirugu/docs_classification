@@ -160,7 +160,6 @@ SUPPORTED_EXTENSIONS = (
 DEFAULT_PDF_PAGES = 15
 DEFAULT_WORKERS = max(1, min(8, os.cpu_count() or 1))
 CACHE_VERSION = 2
-DEFAULT_CACHE_PATH = Path(__file__).with_name(".language_classify_cache.json")
 
 
 def clean_text(value):
@@ -742,8 +741,11 @@ def main():
     )
     parser.add_argument(
         "--cache",
-        default=str(DEFAULT_CACHE_PATH),
-        help=f"Classification cache path. Defaults to {DEFAULT_CACHE_PATH}.",
+        default=None,
+        help=(
+            "Override the cache file path. By default the cache is stored inside the target "
+            "folder as .language_classify_cache.json so each folder gets its own isolated cache."
+        ),
     )
     parser.add_argument("--no-cache", action="store_true", help="Do not read or write the classification cache.")
     args = parser.parse_args()
@@ -759,25 +761,40 @@ def main():
         destination = target / destination
     destination = destination.resolve()
 
+    # Per-folder cache stored in the script's directory, named after the target folder.
+    # E.g. scanning Downloads\7679000 → .language_classify_cache_7679000.json
+    # Use --cache to override the path entirely.
+    if args.cache is not None:
+        cache_path = Path(args.cache).resolve()
+    else:
+        cache_path = Path(__file__).parent / f".language_classify_cache_{target.name}.json"
+    if not args.no_cache:
+        print(f"Cache: {cache_path}")
+
     if not args.dry_run:
         destination.mkdir(exist_ok=True)
 
     files = [path for path in sorted(target.rglob("*")) if path.is_file()]
     moved = []
     skipped = []
-    
-    cache_path = Path(args.cache).resolve()
+
     cache = {} if args.no_cache else load_cache(cache_path)
 
     files_to_scan = []
     for path in files:
-        if path.resolve() != Path(__file__).resolve() and destination not in path.resolve().parents:
+        if (
+            path.resolve() != Path(__file__).resolve()
+            and destination not in path.resolve().parents
+        ):
             files_to_scan.append(path)
 
     # Fix extensions before classification
     if not args.dry_run:
         fixed_files = []
         for path in files_to_scan:
+            if not path.exists():
+                print(f"  [skip] {path.name}: file not found, skipping.")
+                continue
             fixed_files.append(fix_file_extension(path))
         files_to_scan = fixed_files
 
@@ -788,7 +805,10 @@ def main():
     for path in files_to_scan:
         key = cache_key(path, pdf_pages, args.skip_pdf_text)
         cached = cache.get(key) if key else None
-        if cached:
+        if cached and path.exists():
+            # Guard: only trust cache if the file still exists on disk.
+            # The key already encodes size+mtime, so a changed file won't match,
+            # but an outright missing file should be reclassified, not skipped.
             language, confidence, source = cached
             classified.append((path, language, confidence, source))
         else:
@@ -797,8 +817,13 @@ def main():
     if workers == 1:
         # Run sequentially in main process to avoid BrokenProcessPool on segfaults
         for path in files_to_classify:
+            if not path.exists():
+                print(f"  [skip] {path.name}: file not found, skipping.")
+                continue
             try:
                 classified.append(classify_file(path, pdf_pages, args.skip_pdf_text))
+            except FileNotFoundError:
+                print(f"  [skip] {path.name}: file not found during classification, skipping.")
             except Exception as e:
                 print(f"Error processing {path.name}: {e}")
                 classified.append((path, "Unknown", 0, "error"))
@@ -823,26 +848,50 @@ def main():
                         classified.append((path, "Unknown", 0, "error"))
 
     if not args.no_cache:
+        # Add/update entries for files just classified
         for path, language, confidence, source in classified:
             key = cache_key(path, pdf_pages, args.skip_pdf_text)
             if key:
                 cache[key] = [language, confidence, source]
+
+        # Prune stale entries whose file path no longer exists on disk.
+        # Cache key layout: CACHE_VERSION|resolved_path|size|mtime_ns|pdf_pages|skip_pdf_text
+        live_paths = {str(p.resolve()).lower() for p in files_to_scan}
+        stale_keys = [
+            k for k in list(cache.keys())
+            if len(k.split("|")) >= 3 and k.split("|")[1] not in live_paths
+        ]
+        for k in stale_keys:
+            del cache[k]
+        if stale_keys:
+            print(f"  [cache] Pruned {len(stale_keys)} stale cache entries for files no longer on disk.")
+
         save_cache(cache_path, cache)
 
     classified.sort(key=lambda item: item[0].name)
 
     for path, language, confidence, source in classified:
-        should_move = language not in ("English", "Unknown") and confidence >= 55
+        is_non_english = language not in ("English", "Unknown") and confidence >= 55
+        # Only move to Unknown/ when the file IS a supported type but language could not be
+        # determined (e.g. image-only PDF, too-short text). Files with source=="unsupported"
+        # have an extension we don't recognise even after magic-byte detection — leave them.
+        is_unknown = language == "Unknown" and source != "unsupported"
 
-        if should_move:
+        if is_non_english or is_unknown:
             moved.append((path.name, language, confidence, source))
             if not args.dry_run:
                 if not path.exists():
-                    continue  # Already moved by a previous run, skip
+                    print(f"  [skip] {path.name}: file not found, skipping move.")
+                    continue
                 safe_language = language.replace("/", "-").replace("\\", "-")
                 lang_destination = destination / safe_language
                 lang_destination.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(path), str(unique_destination(lang_destination, path.name)))
+                try:
+                    shutil.move(str(path), str(unique_destination(lang_destination, path.name)))
+                except FileNotFoundError:
+                    print(f"  [skip] {path.name}: file not found during move, skipping.")
+                except Exception as e:
+                    print(f"  [error] {path.name}: could not move — {e}")
         else:
             skipped.append((path.name, language, confidence, source))
 
